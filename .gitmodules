@@ -1,0 +1,3 @@
+[submodule "libs/control/object_react"]
+	path = libs/control/object_react
+	url = https://github.com/MlLearnerAkash/libs_control_object_react.git
