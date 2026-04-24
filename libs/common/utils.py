@@ -763,6 +763,18 @@ def compute_pose_err(s1, s2):
 
 # Habitat Semantics
 def findAnnotationPath(scenePath):
+    # MP3D: look for mp3d.scene_dataset_config.json next to the scan directory
+    # (e.g. .../mp3d_habitat/mp3d/<scan>/<scan>.glb -> .../mp3d_habitat/mp3d/mp3d.scene_dataset_config.json)
+    if "mp3d" in scenePath.lower():
+        scan_dir = os.path.dirname(scenePath)
+        parent = os.path.dirname(scan_dir)
+        for cand in (
+            os.path.join(parent, "mp3d.scene_dataset_config.json"),
+            os.path.join(scan_dir, "mp3d.scene_dataset_config.json"),
+        ):
+            if os.path.isfile(cand):
+                return cand
+
     # find split name from among ['train', 'val', 'test', 'minival']
     split = None
     for s in ['train', 'minival', 'val', 'test']:  # TODO: 'val' inside 'minival'
@@ -951,17 +963,26 @@ def get_hm3d_scene_name_from_episode_path(path_episode, path_scenes_root_hm3d):
 
 
 def create_results_summary(args, results_summary, path_results_folder):
-    # Calculate success rate
-    results_summary['success_rate'] = (results_summary['successful_episodes'] /
-                                       results_summary['total_episodes']) * 100 if results_summary[
-                                                                                       'total_episodes'] > 0 else 0
+    # Calculate success rate over *all* attempted episodes (including skipped)
+    total = results_summary['total_episodes']
+    skipped = results_summary.get('skipped_unreachable', 0)
+    solvable = total - skipped
+    results_summary['success_rate'] = (
+        results_summary['successful_episodes'] / total * 100
+    ) if total > 0 else 0
+    results_summary['success_rate_solvable'] = (
+        results_summary['successful_episodes'] / solvable * 100
+    ) if solvable > 0 else 0
 
     # Print and save results summary
     print("\n--- Results Summary ---")
-    print(f"Total Episodes: {results_summary['total_episodes']}")
-    print(f"Successful Episodes: {results_summary['successful_episodes']}")
-    print(f"Failed Episodes: {results_summary['failed_episodes']}")
-    print(f"Success Rate: {results_summary['success_rate']:.2f}%")
+    print(f"Total Episodes:            {total}")
+    print(f"  Skipped (unreachable):   {skipped}  ← NavMesh-disconnected, not counted as failures")
+    print(f"  Solvable:                {solvable}")
+    print(f"Successful Episodes:       {results_summary['successful_episodes']}")
+    print(f"Failed Episodes:           {results_summary['failed_episodes']}")
+    print(f"Success Rate (all):        {results_summary['success_rate']:.2f}%")
+    print(f"Success Rate (solvable):   {results_summary['success_rate_solvable']:.2f}%")
 
     print("\nFailure Reasons:")
     for reason, count in results_summary['failure_reasons'].items():
@@ -973,14 +994,13 @@ def create_results_summary(args, results_summary, path_results_folder):
         with open(results_csv_path, 'w', newline='') as csvfile:
             csvwriter = csv.writer(csvfile)
             csvwriter.writerow(['Metric', 'Value'])
-            csvwriter.writerow(
-                ['Total Episodes', results_summary['total_episodes']])
-            csvwriter.writerow(
-                ['Successful Episodes', results_summary['successful_episodes']])
-            csvwriter.writerow(
-                ['Failed Episodes', results_summary['failed_episodes']])
-            csvwriter.writerow(
-                ['Success Rate (%)', f"{results_summary['success_rate']:.2f}"])
+            csvwriter.writerow(['Total Episodes', total])
+            csvwriter.writerow(['Skipped (unreachable goal)', skipped])
+            csvwriter.writerow(['Solvable Episodes', solvable])
+            csvwriter.writerow(['Successful Episodes', results_summary['successful_episodes']])
+            csvwriter.writerow(['Failed Episodes', results_summary['failed_episodes']])
+            csvwriter.writerow(['Success Rate (%) [all]', f"{results_summary['success_rate']:.2f}"])
+            csvwriter.writerow(['Success Rate (%) [solvable only]', f"{results_summary['success_rate_solvable']:.2f}"])
 
             csvwriter.writerow([])
             csvwriter.writerow(['Failure Reasons'])

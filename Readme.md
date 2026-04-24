@@ -110,6 +110,11 @@ python scripts/create_maps_hm3d.py ./data/hm3d_iin_val/ fast_sam None 0 1
 ### TRAIN
 Please see instructions [here](https://github.com/oravus/object-react?tab=readme-ov-file#train).
 
+### convert .h5 to mp3d_iin
+```bash
+python eval/scripts/build_mp3d_iin_from_h5.py
+```
+
 # Cite
 ObjectReact:
 ```
@@ -145,3 +150,12 @@ RoboHop:
   organization={IEEE}
 }
 ```
+
+#-----------
+1. Changes: 
+- v_max: 0.05 → 0.15 m/s
+- w_max: 0.05 → 0.15 rad/s
+
+2. max_steps: 300 → 500
+3. Collision escape after 5 stuck steps
+4. max_steps: 300 → 500

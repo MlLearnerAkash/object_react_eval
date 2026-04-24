@@ -36,12 +36,57 @@ default_logger.setup_logging(level=os.environ["LOG_LEVEL"])
 
 from libs.common import utils
 from libs.experiments import task_setup
+from libs.experiments.task_setup import UnreachableGoalError
+
+
+def _filter_episodes_by_h5(episodes, h5_file):
+    """Keep only episodes whose numeric ID appears as a key in *h5_file*.
+
+    Episode dir names follow the pattern ``<scene>_<zero-padded-id>_<cat>_<inst>_``
+    (e.g. ``17DRP5sb8fy_0011458_sink_216_``).  The numeric id field is
+    ``split('_')[1]`` which may have leading zeros; H5 keys are stripped
+    integers (e.g. ``"11458"``).  Episodes absent from the H5 are dropped
+    because they would run with an empty instruction string.
+    """
+    if h5_file is None:
+        return episodes
+    h5_keys = set(h5_file.keys())
+    kept, dropped = [], []
+    for p in episodes:
+        parts = p.name.split("_")
+        # Robust: strip leading zeros via int() conversion
+        ep_id = str(int(parts[1])) if len(parts) > 1 and parts[1].isdigit() else p.name
+        if ep_id in h5_keys:
+            kept.append(p)
+        else:
+            dropped.append(p.name)
+    if dropped:
+        print(
+            f"[lang_e3d] H5 filter: dropped {len(dropped)} episodes with no instruction "
+            f"(not in H5): {dropped[:5]}{'...' if len(dropped) > 5 else ''}"
+        )
+    print(f"[lang_e3d] H5 filter: {len(kept)}/{len(kept) + len(dropped)} episodes have H5 data")
+    return kept
 
 
 def run(args):
-    # set up all the paths
+    # # set up all the paths
     path_dataset = Path(args.path_dataset)
-    path_scenes_root_hm3d = path_dataset / "hm3d_v0.2" / args.split
+
+    # Scene dataset selection: hm3d (default) or mp3d. For mp3d the scenes live
+    # in <scene_root>/<scan>/<scan>.glb instead of HM3D's *<id>_dir/ basis.glb.
+    scene_dataset = getattr(args, "scene_dataset", "hm3d").lower()
+    explicit_scenes_root = getattr(args, "path_scenes_root", "") or ""
+    if explicit_scenes_root:
+        path_scenes_root_hm3d = Path(explicit_scenes_root)
+    elif scene_dataset == "mp3d":
+        # default MP3D location used in this workspace
+        path_scenes_root_hm3d = Path(
+            "/data/dataset/RXR/dataset/mp3d/data/scene_datasets/mp3d/v1/tasks/mp3d_habitat/mp3d"
+        )
+    else:
+        path_scenes_root_hm3d = path_dataset / "hm3d_v0.2" / args.split
+
     sh_map = args.sim["sensor_height_map"]
     if args.task_type == "via_alt_goal":
         map_dir = f"hm3d_generated/stretch_maps/hm3d_iin_{args.split}/maps_via_alt_goal"
@@ -55,14 +100,20 @@ def run(args):
         else:
             map_dir = f"hm3d_iin_{args.split}"
 
-    path_episode_root = path_dataset / map_dir
+    explicit_episodes_root = getattr(args, "path_episodes_root", "") or ""
+    if explicit_episodes_root:
+        path_episode_root = Path(explicit_episodes_root)
+    else:
+        path_episode_root = path_dataset / map_dir
     print(f"Root path for episodes: {path_episode_root}")
+    print(f"Scene dataset: {scene_dataset}, scenes root: {path_scenes_root_hm3d}")
 
     # Results tracking
     results_summary = {
         "total_episodes": 0,
         "successful_episodes": 0,
         "failed_episodes": 0,
+        "skipped_unreachable": 0,   # NavMesh-disconnected episodes
         "success_rate": 0.0,
         "failure_reasons": {},
     }
@@ -77,6 +128,12 @@ def run(args):
     episodes = task_setup.load_run_list(args, path_episode_root)[
         args.start_idx : args.end_idx : args.step_idx
     ]
+
+    # For lang_e3d: optionally restrict to episodes present in the H5 file
+    h5_path = getattr(args, "h5_path", None)
+    if args.goal_source == "lang_e3d" and h5_path:
+        episodes = _filter_episodes_by_h5(episodes, preload_data.get("h5_file"))
+
     if len(episodes) == 0:
         raise ValueError(
             f"No episodes found at {path_episode_root=}. Please check the dataset path and indices."
@@ -90,8 +147,12 @@ def run(args):
     ):
         results_summary["total_episodes"] += 1
         episode_name = path_episode.parts[-1].split("_")[0]
-        path_scene_hm3d = sorted(path_scenes_root_hm3d.glob(f"*{episode_name}"))[0]
-        scene_name_hm3d = str(sorted(path_scene_hm3d.glob("*basis.glb"))[0])
+        if scene_dataset == "mp3d":
+            # MP3D layout: <scenes_root>/<scan>/<scan>.glb
+            scene_name_hm3d = str(path_scenes_root_hm3d / episode_name / f"{episode_name}.glb")
+        else:
+            path_scene_hm3d = sorted(path_scenes_root_hm3d.glob(f"*{episode_name}"))[0]
+            scene_name_hm3d = str(sorted(path_scene_hm3d.glob("*basis.glb"))[0])
 
         episode_runner = None
         success_status = None
@@ -143,6 +204,14 @@ def run(args):
 
                 print(f"...Steps completed: {step + 1}/{args.max_steps}", end="\r")
 
+        except UnreachableGoalError as e:
+            # Clean skip — goal is on a disconnected NavMesh island.
+            # episode_runner.close() was already called inside ready_agent().
+            success_status = "unreachable_goal"
+            logger.warning(str(e))
+            if args.except_exit:
+                exit(-1)
+
         except Exception as e:
             exc_type, exc_obj, exc_tb = sys.exc_info()
             e_filename = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
@@ -159,7 +228,7 @@ def run(args):
                     episode_runner.close(step)
                 exit(-1)
 
-        if episode_runner is not None:
+        if episode_runner is not None and success_status != "unreachable_goal":
             episode_runner.close(step)  # need to close vis first to save video to wandb
             if args.log_wandb:
                 task_setup.wandb_log_episode(
@@ -170,7 +239,9 @@ def run(args):
             success_status = episode_runner.success_status
 
         # Track success and failure statistics
-        if success_status is None or "success" in success_status.lower():
+        if success_status == "unreachable_goal":
+            results_summary["skipped_unreachable"] += 1
+        elif success_status is None or "success" in success_status.lower():
             results_summary["successful_episodes"] += 1
         else:
             results_summary["failed_episodes"] += 1
@@ -239,6 +310,25 @@ if __name__ == "__main__":
             "pavement",
             "ground",
             "tiles",
+            # "door",
+            # "wall",
+            # "table",
+            # "tv_monitor",
+            # "sink",
+            # "cushion",
+            # "chair",
+            # "window",
+            # "towel",
+            # "plant",
+            # "shelving",
+            # "curtain",
+            # "seating",
+            # "picture",
+            # "bed",
+            # "couch",
+            # "stair",
+            # "staircase",
+            # "window"
         ],
     )
 

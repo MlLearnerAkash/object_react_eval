@@ -24,7 +24,7 @@ env: "sim"
 split: "test"
 threshold_goal_distance: 1.0
 max_start_distance: "hard"
-max_steps: 300
+max_steps: 500
 
 exp_name: "lang_mp3d_eval"
 
@@ -40,7 +40,7 @@ infer_depth: False
 infer_traversable: False
 
 # lang_e3d-specific
-joint_checkpoint: '/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426.pth'
+joint_checkpoint: '/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
 h5_path: '/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_test.h5'
 
 # logging and display
@@ -81,6 +81,6 @@ goal_gen:
 controller:
   config_file: "configs/controller/object_react_controller.yaml"
   v_min: 0.05
-  v_max: 0.2
-  w_min: -0.3
-  w_max: 0.3
+  v_max: 0.40
+  w_min: -0.5
+  w_max: 0.5

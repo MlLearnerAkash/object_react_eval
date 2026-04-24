@@ -1,6 +1,17 @@
 import os
+import math
 import numpy as np
 from pathlib import Path
+
+
+class UnreachableGoalError(RuntimeError):
+    """Raised when start and goal positions are on disconnected NavMesh islands.
+
+    This typically means the episode was built with a goal that cannot be
+    reached via any navigable path from the agent's start position
+    (geodesic_distance == inf).  The episode should be skipped rather than
+    run for the full step budget.
+    """
 import pickle
 import yaml
 import torch
@@ -52,6 +63,19 @@ class Episode:
         self.agent_states = None
         self.final_goal_position = None
         self.traversable_class_indices = None
+
+        # Load episode instruction for lang_e3d goal source
+        self.episode_instruction = ""
+        if self.args.goal_source.lower() == "lang_e3d":
+            h5_file = self.preload_data.get("h5_file")
+            if h5_file is not None:
+                # episode dir name is "ep_10014" → id is "10014"
+                ep_num = path_episode.name.split("_")[1][2:] if "_" in path_episode.name else path_episode.name
+                if ep_num in h5_file:
+                    self.episode_instruction = h5_file[ep_num]["instruction"][()].decode("utf-8")
+                    logger.info(f"Loaded instruction for ep {ep_num}: {self.episode_instruction[:80]}...")
+                else:
+                    logger.warning(f"Episode {ep_num} not found in H5 file; using empty instruction")
 
         if self.args.log_robot:
             episode_results_dir = f"{self.path_episode.parts[-1]}_{self.args.method.lower()}_{self.args.goal_source}"
@@ -118,6 +142,10 @@ class Episode:
         )
         if self.args.env == "sim":
             self.vis.draw_teach_run(self.agent_states)
+
+            # marker so the BEV start matches the real spawn location.
+            if not self.args.reverse:
+                self.vis.draw_start(self.vis.sim_to_tdv(self.start_position))
 
             if self.args.task_type in ["alt_goal"]:
                 self.vis.draw_goal(self.vis.sim_to_tdv(self.final_goal_position))
@@ -238,11 +266,26 @@ class Episode:
             self.sim, p1=self.start_position, p2=self.final_goal_position
         )[0]
 
+        # Guardrail: skip episodes where the goal is on a disconnected NavMesh
+        # island — the agent can never reach it regardless of how long it runs.
+        if math.isinf(self.distance_to_final_goal):
+            self.success_status = "unreachable_goal"
+            self.close()
+            raise UnreachableGoalError(
+                f"Goal is unreachable from start (geodesic_distance=inf) "
+                f"for episode {self.path_episode.name}. "
+                f"Start: {self.start_position}, Goal: {self.final_goal_position}. "
+                f"Skipping — start and goal are on disconnected NavMesh islands."
+            )
+
+
     def get_map_graph_path(self):
         self.path_graph = None
         goal_source = self.args.goal_source.lower()
         if goal_source == "gt_metric":
             pass
+        elif goal_source == "lang_e3d":
+            pass  # No map graph needed; instruction drives the goal
         elif goal_source in ["gt_topological", "topological", "gt_topometric"]:
             # load robohop graph
             graph_filename = None
@@ -476,6 +519,9 @@ class Episode:
         elif goal_source == "gt_metric":
             # map_graph is not needed
             pass
+        elif goal_source == "lang_e3d":
+            # No graph or goal generator needed; instruction is stored per-episode
+            pass
         elif goal_source in ["gt_topological", "gt_topometric"]:
             self.get_goal_object_id()
             self.precompute_graph_paths()
@@ -491,6 +537,9 @@ class Episode:
                     self.goalie.map_images.append(cv2.imread(str(img_path))[:, :, ::-1])
                 self.goalie.goal_idx, _ = self.get_GT_closest_map_img()
                 self.goalie.num_map_images = len(self.goalie.map_images)
+        elif goal_source == "lang_e3d":
+            # Goal is built online from language + LangGeoNetV2; no static map needed.
+            pass
         else:
             raise NotImplementedError(f"{self.args.goal_source=} is not defined...")
 
@@ -737,6 +786,83 @@ class Episode:
                 raise NotImplementedError(
                     f'{goal_source=} only defined for {control_method=}...')
 
+        elif goal_source == "lang_e3d":
+            from PIL import Image as _PIL_Image
+
+            segmentor = self.preload_data.get("segmentor")
+            lange3d = self.preload_data["lange3d"]
+            clip_processor = self.preload_data["clip_processor"]
+            device = self.device
+
+            # ── FastSAM segmentation ──────────────────────────────────────────
+            if segmentor is not None:
+                seg_result = segmentor.segment(rgb[:, :, :3], retMaskAsDict=False)
+                if seg_result[0] is None:
+                    masks_np = np.zeros((0, rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+                else:
+                    masks_np = seg_result[0].astype(np.uint8)  # [K, H, W]
+            else:
+                masks_np = np.zeros((0, rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+
+            K = masks_np.shape[0]
+
+            if K == 0:
+                # Nothing to encode this frame; let downstream handle stop signal.
+                self.control_input_learnt = [None, None]
+                self.control_input_robohop = semantic_instance
+                # Flat goal_mask (max cost everywhere) matching gt_topometric format
+                self.goal_mask = np.full(
+                    (rgb.shape[0], rgb.shape[1]), fill_value=1.0, dtype=np.float32
+                )
+            else:
+                # ── CLIP image + instruction tokenization ─────────────────────
+                clip_inputs = clip_processor(
+                    images=_PIL_Image.fromarray(rgb[:, :, :3].astype(np.uint8)),
+                    text=[self.episode_instruction],
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=77,
+                )
+                pixel_values = clip_inputs["pixel_values"].to(device)
+                input_ids = clip_inputs["input_ids"].to(device)
+                attn_mask = clip_inputs["attention_mask"].to(device)
+
+                masks_tensor = torch.from_numpy(masks_np.astype(bool)).to(device)
+
+                # ── LangGeoNetV2 → per-object cost (lower = closer to goal) ──
+                with torch.no_grad():
+                    lang_preds, _ = lange3d(
+                        pixel_values, [masks_tensor], input_ids, attn_mask)
+
+                # lang_preds is a list[B] of [K_b] tensors; B==1 here.
+                logits = lang_preds[0].detach().float().cpu().numpy()
+                if logits.shape[0] != K:
+                    raise RuntimeError(
+                        f"LangGeoNet returned {logits.shape[0]} costs for {K} masks")
+
+                #Min-max normalise to [0, 1]; lower = closer to goal
+                lo, hi = float(logits.min()), float(logits.max())
+                if hi - lo > 1e-8:
+                    pls = (logits - lo) / (hi - lo)
+                else:
+                    pls = np.zeros_like(logits)
+                goal_mask = np.ones(
+                    (rgb.shape[0], rgb.shape[1]), dtype=np.float32
+                )  # default = max cost
+                masks_bool = masks_np.astype(bool)  # [K, H, W]
+                order = np.argsort(pls)[::-1]  # descending pls
+                for ki in order:
+                    goal_mask[masks_bool[ki]] = pls[ki]
+
+                self.goal_mask = goal_mask  # (H, W) float32, low = near goal
+
+                # ── control_input_robohop: semantic_instance for robohop/tango
+                # self.control_input_robohop = semantic_instance
+
+                # ── control_input_learnt: [masks, pls] for learnt controller ──
+                self.control_input_learnt = [masks_bool, pls.astype(np.float32)]
+
         else:
             raise NotImplementedError(f"{self.args.goal_source} is not available...")
 
@@ -786,7 +912,12 @@ class Episode:
                 rgb, self.collided)
 
         elif control_method == 'learnt':
-            if self.control_input_learnt[0] is None or self.control_input_learnt[1] is None:
+            if isinstance(self.control_input_learnt, torch.Tensor):
+                # lang_e3d: goal already encoded as tensor [1, dims, H, W]
+                self.velocity_control, self.theta_control, self.vis_img = \
+                    self.goal_controller.predict_from_goal_enc(
+                        rgb, self.control_input_learnt)
+            elif self.control_input_learnt[0] is None or self.control_input_learnt[1] is None:
                 self.velocity_control, self.theta_control, self.vis_img = 0, 0, self.vis_img_default.copy()
             else:
                 self.velocity_control, self.theta_control, self.vis_img = self.goal_controller.predict(
@@ -815,14 +946,42 @@ class Episode:
             current_state = self.agent.state
             self.collided = utils.has_collided(self.sim, previous_state, current_state)
         else:
-            self.agent, self.sim, self.collided = utils.apply_velocity(
-                vel_control=self.vel_control,
-                agent=self.agent,
-                sim=self.sim,
-                velocity=self.velocity_control,
-                steer=-self.theta_control,  # opposite y axis
-                time_step=self.time_delta,
-            )
+            # ── Collision escape: reverse + hard-turn after 5 stuck steps ─────
+            _ESCAPE_THRESHOLD = 5
+            if self.collided:
+                self.goal_controller.consecutive_collisions = getattr(
+                    self.goal_controller, 'consecutive_collisions', 0) + 1
+            else:
+                self.goal_controller.consecutive_collisions = 0
+
+            if self.goal_controller.consecutive_collisions >= _ESCAPE_THRESHOLD:
+                logger.warning(
+                    f"Collision escape triggered after "
+                    f"{self.goal_controller.consecutive_collisions} stuck steps"
+                )
+                escape_v = -0.05                   # reverse
+                escape_w = 0.5                     # hard left turn
+                # Reset EMA so the next prediction starts fresh
+                self.goal_controller._ema_wp = None
+                self.goal_controller.consecutive_collisions = 0
+                self.agent, self.sim, self.collided = utils.apply_velocity(
+                    vel_control=self.vel_control,
+                    agent=self.agent,
+                    sim=self.sim,
+                    velocity=escape_v,
+                    steer=escape_w,
+                    time_step=self.time_delta,
+                )
+            else:
+                self.agent, self.sim, self.collided = utils.apply_velocity(
+                    vel_control=self.vel_control,
+                    agent=self.agent,
+                    sim=self.sim,
+                    velocity=self.velocity_control,
+                    steer=-self.theta_control,  # opposite y axis
+                    time_step=self.time_delta,
+                )
+
 
     def is_done(self):
         done = False
@@ -1137,6 +1296,45 @@ def preload_models(args):
         "segmentor": segmentor,
         "depth_model": depth_model,
     }
+
+    # ── lang_e3d: joint checkpoint + segmentor + optional H5 file ────────────
+    if args.goal_source == "lang_e3d":
+        # Segmentor is needed at every step for online segmentation
+        if preload_data["segmentor"] is None:
+            traversable_class_names = (
+                args.traversable_class_names
+                if args.method.lower() == "tango" and args.infer_traversable
+                else None
+            )
+            preload_data["segmentor"] = model_loader.get_segmentor(
+                getattr(args, "segmentor", "fast_sam"),
+                args.sim["width"],
+                args.sim["height"],
+                path_models=getattr(args, "path_models", None),
+                traversable_class_names=traversable_class_names,
+            )
+
+        # Load joint models (LangGeoNetV2 + GNM + TopoPaths + CLIPProcessor)
+        joint_checkpoint = getattr(args, "joint_checkpoint", None)
+        if joint_checkpoint is None:
+            raise ValueError(
+                "joint_checkpoint must be set in config for goal_source=lang_e3d")
+        joint = model_loader.get_joint_models(joint_checkpoint)
+
+        # Replace the controller's GNM weights with the joint checkpoint's GNM
+        if goal_controller is not None:
+            goal_controller.model = joint["gnm_joint"]
+
+        preload_data["lange3d"] = joint["lange3d"]
+        preload_data["topopaths"] = joint["topopaths"]
+        preload_data["clip_processor"] = joint["clip_processor"]
+
+        # Open H5 file so each episode can read its instruction
+        h5_path = getattr(args, "h5_path", None)
+        if h5_path:
+            import h5py as _h5py
+            preload_data["h5_file"] = _h5py.File(h5_path, "r")
+
     return preload_data
 
 

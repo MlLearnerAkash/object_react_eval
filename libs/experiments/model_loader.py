@@ -79,3 +79,75 @@ def get_segmentor(segmentor_name, image_width, image_height, device=None,
         raise NotImplementedError(f'{segmentor_name=} not implemented...')
 
     return segmentor
+
+
+def get_joint_models(joint_checkpoint_path, device=None):
+    """Load LangGeoNetV2 + GNM (joint checkpoint) for lang_e3d goal source.
+
+    Returns a dict with keys:
+        lange3d      : LangGeoNetV2 model (eval mode, on device)
+        gnm_joint    : GNM model (eval mode, on device)
+        topopaths    : TopoPaths instance
+        clip_processor : CLIPProcessor
+    """
+    import sys
+    import warnings
+    from pathlib import Path as _Path
+
+    TRAIN_DIR = _Path("/data/ws/VLN-CE/controller/object_react/train")
+    for _p in [str(TRAIN_DIR), str(TRAIN_DIR / "lange3dnet_train")]:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+
+    # Install mock _magnum so graphs pickled with Habitat C++ types can be
+    # loaded without the native extension.
+    from joint_dataset import _install_mock_magnum
+    _install_mock_magnum()
+
+    from vint_train.models.gnm.gnm import GNM
+    from vint_train.models.object_react.dataloader import TopoPaths
+    from model import LangGeoNetV2
+    from transformers import CLIPProcessor
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    elif isinstance(device, str):
+        device = torch.device(device)
+
+    # Architecture must match training (MODEL_CFG in joint_val_app.py)
+    lange3d = LangGeoNetV2(
+        d_model=256, n_heads=8, n_layers=2,
+        clip_model_name="openai/clip-vit-base-patch16",
+        dino_model_name="facebook/dinov2-small",
+        freeze_clip=True, freeze_dino=True,
+    ).to(device)
+
+    gnm = GNM(
+        context_size=5, len_traj_pred=10, learn_angle=True,
+        obs_encoding_size=1024, goal_encoding_size=1024,
+        goal_type="image_mask_enc", obs_type="disabled",
+        dims=8, use_mask_grad=False, goal_uses_context=False,
+    ).to(device)
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore")
+        ckpt = torch.load(joint_checkpoint_path, map_location=device,
+                          weights_only=False)
+
+    lange3d.load_state_dict(ckpt["lange3d"], strict=False)
+    gnm.load_state_dict(ckpt["gnm"], strict=False)
+    lange3d.eval()
+    gnm.eval()
+    print(f"[get_joint_models] loaded epoch {ckpt.get('epoch', '?')} "
+          f"val_spearman={ckpt.get('val_spearman', float('nan')):.4f}")
+
+    topopaths = TopoPaths(dims=8, w=160, h=120)
+    clip_processor = CLIPProcessor.from_pretrained(
+        "openai/clip-vit-base-patch16")
+
+    return {
+        "lange3d": lange3d,
+        "gnm_joint": gnm,
+        "topopaths": topopaths,
+        "clip_processor": clip_processor,
+    }

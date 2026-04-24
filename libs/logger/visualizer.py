@@ -37,8 +37,11 @@ class Visualizer:
             self.init_video(video_cfg)
 
     def init_video(self, video_cfg):
+        w = video_cfg.get('width', self.tdv_dims[1])
+        h = video_cfg.get('height', self.tdv_dims[0])
+        self._video_size = (int(w), int(h))   # (W, H) used by VideoWriter
         self.video = cv2.VideoWriter(video_cfg['savepath'], cv2.VideoWriter_fourcc(
-            *video_cfg['codec']), video_cfg['fps'], (video_cfg.get('width', self.tdv_dims[1]), video_cfg.get('height', self.tdv_dims[0])))
+            *video_cfg['codec']), video_cfg['fps'], self._video_size)
 
     def create_top_down_map(self, height=None, meters_per_pixel=0.025):
         if height is None:
@@ -148,6 +151,12 @@ class Visualizer:
     def save_video_frame(self, rgb=None):
         if rgb is None:
             rgb = self.tdv
+        # FFmpeg silently drops frames whose size != the writer's configured
+        # (W, H).  The matplotlib-rendered vis_img can vary slightly between
+        # steps, so resize defensively to the writer's locked size.
+        target_size = getattr(self, "_video_size", None)
+        if target_size is not None and (rgb.shape[1], rgb.shape[0]) != target_size:
+            rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_AREA)
         self.video.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
 
     def close(self):

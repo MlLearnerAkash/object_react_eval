@@ -8,7 +8,7 @@ obs_type: "disabled" # ["image", "disabled", "image_mask_enc"]
 dims: 8
 goal_uses_context: False
 is_pl_normalized: False
-use_vel_filter: True
+use_vel_filter: False
 use_mask_grad: False
 
 # navigation params, from deployment/src/navigate.py
