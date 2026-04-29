@@ -1,4 +1,5 @@
 import os
+import json
 import math
 import numpy as np
 from pathlib import Path
@@ -64,18 +65,35 @@ class Episode:
         self.final_goal_position = None
         self.traversable_class_indices = None
 
-        # Load episode instruction for lang_e3d goal source
+        # Resolve episode numeric ID (strips 7-digit zero-padding: "0011458" → "11458")
+        _parts = path_episode.name.split("_")
+        _raw_id = _parts[1] if len(_parts) > 1 else path_episode.name
+        self.ep_num = str(int(_raw_id)) if _raw_id.isdigit() else _raw_id
+
+        self.instruction_type = getattr(self.args, "instruction_type", "episodic")
+
+        # Episodic instruction: prefer instruction.txt in the episode folder
+        # (written by build_mp3d_iin_from_h5.py), fall back to H5 file.
         self.episode_instruction = ""
-        if self.args.goal_source.lower() == "lang_e3d":
+        _instr_txt = path_episode / "instruction.txt"
+        if _instr_txt.exists():
+            self.episode_instruction = _instr_txt.read_text().strip()
+            logger.info(f"[ep {self.ep_num}] episodic instruction (from txt): "
+                        f"{self.episode_instruction[:80]}…")
+        elif self.args.goal_source.lower() == "lang_e3d":
             h5_file = self.preload_data.get("h5_file")
-            if h5_file is not None:
-                # episode dir name is "ep_10014" → id is "10014"
-                ep_num = path_episode.name.split("_")[1][2:] if "_" in path_episode.name else path_episode.name
-                if ep_num in h5_file:
-                    self.episode_instruction = h5_file[ep_num]["instruction"][()].decode("utf-8")
-                    logger.info(f"Loaded instruction for ep {ep_num}: {self.episode_instruction[:80]}...")
-                else:
-                    logger.warning(f"Episode {ep_num} not found in H5 file; using empty instruction")
+            if h5_file is not None and self.ep_num in h5_file:
+                self.episode_instruction = (
+                    h5_file[self.ep_num]["instruction"][()].decode("utf-8")
+                )
+                logger.info(f"[ep {self.ep_num}] episodic instruction (from H5): "
+                            f"{self.episode_instruction[:80]}…")
+            else:
+                logger.warning(f"[ep {self.ep_num}] no instruction.txt and not in H5; "
+                               "using empty instruction")
+
+        # Run-level instruction LMDB (built by build_run_instructions_lmdb in run())
+        self.instr_lmdb = self.preload_data.get("instr_lmdb")
 
         if self.args.log_robot:
             episode_results_dir = f"{self.path_episode.parts[-1]}_{self.args.method.lower()}_{self.args.goal_source}"
@@ -794,6 +812,29 @@ class Episode:
             clip_processor = self.preload_data["clip_processor"]
             device = self.device
 
+            # ── Resolve instruction for this step ─────────────────────────────
+            # "episodic"     : same episode-level instruction every step.
+            # "next_action"  : look up per-frame NAI from the run-level LMDB
+            #                  (built in run() by build_run_instructions_lmdb).
+            #                  Falls back to episodic when entry is missing/empty.
+            instruction = self.episode_instruction
+            if (self.instruction_type == "next_action"
+                    and self.instr_lmdb is not None
+                    and goal_img_idx is not None):
+                _key = f"{self.ep_num}/{goal_img_idx:03d}".encode("utf-8")
+                with self.instr_lmdb.begin() as _txn:
+                    _raw = _txn.get(_key)
+                if _raw is not None:
+                    _rec = pickle.loads(_raw)
+                    nai = _rec.get("next_action_instruction", "")
+                    if nai:
+                        instruction = nai
+                        logger.debug(f"[ep {self.ep_num} frame {goal_img_idx:03d}] "
+                                     f"NAI: {nai[:60]}…")
+                    else:
+                        logger.debug(f"[ep {self.ep_num} frame {goal_img_idx:03d}] "
+                                     "empty NAI — using episodic")
+
             # ── FastSAM segmentation ──────────────────────────────────────────
             if segmentor is not None:
                 seg_result = segmentor.segment(rgb[:, :, :3], retMaskAsDict=False)
@@ -818,7 +859,7 @@ class Episode:
                 # ── CLIP image + instruction tokenization ─────────────────────
                 clip_inputs = clip_processor(
                     images=_PIL_Image.fromarray(rgb[:, :, :3].astype(np.uint8)),
-                    text=[self.episode_instruction],
+                    text=[instruction],
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
@@ -1261,6 +1302,90 @@ def init_results_dir_and_save_cfg(args, default_logger=None):
             )
 
     return path_results_folder
+
+
+def build_run_instructions_lmdb(episodes: list, path_results_folder: Path,
+                                preload_data: dict) -> None:
+    """Build a single per-run LMDB of instructions from episode folders.
+
+    Called once in run() after the episode list is known.  Reads each
+    episode's ``instruction.txt`` (episodic) and ``next_action_instructions.json``
+    (per-frame NAI, written by build_mp3d_iin_from_h5.py) and stores them in
+
+        <path_results_folder>/instructions.lmdb
+
+    LMDB key layout:
+        b"{ep_num}/{seq_idx:03d}"   →  pickle({"episodic_instruction": str,
+                                                "next_action_instruction": str})
+
+    The opened read-only env is stored in ``preload_data["instr_lmdb"]``.
+    Episodes whose folders lack instruction files are skipped silently.
+    """
+    try:
+        import lmdb as _lmdb
+    except ImportError:
+        logger.warning("lmdb not installed — instruction LMDB disabled. "
+                       "pip install lmdb to enable next_action mode.")
+        return
+
+    lmdb_path = path_results_folder / "instructions.lmdb"
+    lmdb_path.mkdir(parents=True, exist_ok=True)
+    map_size = int(512 * (1 << 20))  # 512 MB virtual (sparse on Linux)
+    all_keys: list[bytes] = []
+    n_ep, n_nai = 0, 0
+
+    with _lmdb.open(str(lmdb_path), map_size=map_size, subdir=True,
+                    meminit=False, map_async=True) as env:
+        for ep_path in episodes:
+            instr_txt = ep_path / "instruction.txt"
+            if not instr_txt.exists():
+                continue
+            episodic = instr_txt.read_text().strip()
+
+            # Parse episode numeric ID ("17DRP5sb8fy_0011458_..." → "11458")
+            parts = ep_path.name.split("_")
+            raw_id = parts[1] if len(parts) > 1 else ep_path.name
+            ep_num = str(int(raw_id)) if raw_id.isdigit() else raw_id
+
+            # Per-frame NAI map {"000": "...", "001": "..."}
+            nai_json = ep_path / "next_action_instructions.json"
+            nai_map: dict = {}
+            if nai_json.exists():
+                try:
+                    nai_map = json.loads(nai_json.read_text())
+                    n_nai += 1
+                except Exception:
+                    pass
+
+            # Determine frame count from agent_states
+            agent_states_path = ep_path / "agent_states.npy"
+            if not agent_states_path.exists():
+                continue
+            n_frames = len(np.load(str(agent_states_path), allow_pickle=True))
+
+            with env.begin(write=True) as txn:
+                for seq_idx in range(n_frames):
+                    key = f"{ep_num}/{seq_idx:03d}".encode("utf-8")
+                    nai = nai_map.get(f"{seq_idx:03d}", "")
+                    record = {
+                        "episodic_instruction": episodic,
+                        "next_action_instruction": nai,
+                    }
+                    txn.put(key, pickle.dumps(record, protocol=4))
+                    all_keys.append(key)
+            n_ep += 1
+
+        with env.begin(write=True) as txn:
+            txn.put(b"__keys__", pickle.dumps(sorted(all_keys), protocol=4))
+
+    logger.info(f"[instructions LMDB] built {len(all_keys)} records "
+                f"from {n_ep} episodes ({n_nai} with NAI) → {lmdb_path}")
+
+    # Open read-only for use during episode navigation
+    preload_data["instr_lmdb"] = _lmdb.open(
+        str(lmdb_path), readonly=True, lock=False,
+        readahead=False, meminit=False,
+    )
 
 
 def preload_models(args):

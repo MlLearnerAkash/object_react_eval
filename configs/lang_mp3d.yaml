@@ -7,14 +7,15 @@ path_models: ''
 path_results: './out/results/'
 
 # Override to point at the MP3D dataset built from the H5.
-path_episodes_root: '/data/ws/VLN-CE/controller/object_react/eval/data/mp3d_iin_test'
+path_episodes_root: "/data/ws/VLN-CE/controller/object_react/eval/dataset/mp3d_iin_test"
+#'/data/ws/VLN-CE/controller/object_react/eval/data/mp3d_iin_test'
 path_scenes_root: '/data/dataset/RXR/dataset/mp3d/data/scene_datasets/mp3d/v1/tasks/mp3d_habitat/mp3d'
 scene_dataset: 'mp3d'
 
 # episode/task settings
 start_idx: 0
 step_idx: 1
-end_idx: -1
+end_idx: 10
 
 reverse: False
 task_type: "original"
@@ -40,8 +41,15 @@ infer_depth: False
 infer_traversable: False
 
 # lang_e3d-specific
-joint_checkpoint: '/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
-h5_path: '/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_test.h5'
+joint_checkpoint: "/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_23_10_35_23_/joint_latest.pth" #'/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
+#/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_28_08_22_43_/joint_latest.pth #
+# h5_path: '/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_action_lmrxr_val_seen_ep200.h5'
+
+# Instruction mode: "episodic" uses the single episode-level instruction for
+# every step.  "next_action" reads the per-frame next_action_instruction from
+# <episode_dir>/instructions.lmdb (written by build_mp3d_iin_from_h5.py).
+# Falls back to the episodic instruction when the LMDB entry is missing/empty.
+instruction_type: "episodic"   # "episodic" | "next_action"
 
 # logging and display
 log_wandb: False

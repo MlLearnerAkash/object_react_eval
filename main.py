@@ -129,10 +129,12 @@ def run(args):
         args.start_idx : args.end_idx : args.step_idx
     ]
 
-    # For lang_e3d: optionally restrict to episodes present in the H5 file
-    h5_path = getattr(args, "h5_path", None)
-    if args.goal_source == "lang_e3d" and h5_path:
-        episodes = _filter_episodes_by_h5(episodes, preload_data.get("h5_file"))
+    # For lang_e3d: build a per-run instruction LMDB from episode folders.
+    # Reads instruction.txt (episodic) and next_action_instructions.json
+    # (per-frame NAI, written by build_mp3d_iin_from_h5.py) for every episode,
+    # then stores both in a single LMDB under path_results_folder.
+    if args.goal_source == "lang_e3d":
+        task_setup.build_run_instructions_lmdb(episodes, path_results_folder, preload_data)
 
     if len(episodes) == 0:
         raise ValueError(

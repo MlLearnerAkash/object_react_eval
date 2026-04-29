@@ -14,6 +14,17 @@ Per-episode files written:
   - instruction.txt            language instruction
   - nodes_gt_topometric.pickle raw graph bytes copied from H5
   - goalImg.png                last-frame RGB
+  - instructions.lmdb/         per-frame instruction LMDB (see below)
+
+The ``instructions.lmdb`` directory is written inside each episode folder and
+stores per-frame records keyed by ``{seq_frame_idx:03d}`` where
+``seq_frame_idx`` is the 0-indexed position of the frame within the episode's
+sorted frame list — matching the ``agent_states`` array index used by the eval
+pipeline for GT-localization step lookups.  Each record is a pickle dict:
+    {"episodic_instruction": str, "next_action_instruction": str}
+``next_action_instruction`` is an empty string when absent from the H5 frame.
+The eval pipeline reads this LMDB to feed per-frame next-action instructions to
+the cost-predictor (set ``instruction_type: next_action`` in the eval config).
 
 Run:
   /home/opervu-user/miniconda3/envs/nav/bin/python \\
@@ -282,7 +293,36 @@ def convert_episode(
     if write_images and last_rgb is not None:
         cv2.imwrite(str(ep_dir / "goalImg.png"), last_rgb[:, :, ::-1])
 
+    _write_next_action_instructions(ep, ep_dir, frame_keys)
     return ep_dir
+
+
+def _write_next_action_instructions(
+    ep: h5py.Group,
+    ep_dir: Path,
+    frame_keys: list[str],
+) -> None:
+    """Write ``<ep_dir>/next_action_instructions.json``.
+
+    Maps ``"seq_idx:03d"`` (0-indexed position in sorted frame list, matching
+    the agent_states index) to the per-frame next_action_instruction string.
+    Frames without a next_action_instruction are stored as empty strings.
+    The LMDB consumed by the eval pipeline is built at main.py startup from
+    this file together with instruction.txt.
+    """
+    import json as _json
+    nai_map: dict[str, str] = {}
+    for seq_idx, fkey in enumerate(frame_keys):
+        frame_grp = ep["frames"][fkey]
+        nai = ""
+        if "next_action_instruction" in frame_grp:
+            raw_nai = frame_grp["next_action_instruction"][()]
+            nai = (raw_nai.decode("utf-8", errors="replace")
+                   if isinstance(raw_nai, (bytes, np.bytes_)) else str(raw_nai))
+        nai_map[f"{seq_idx:03d}"] = nai
+    (ep_dir / "next_action_instructions.json").write_text(
+        _json.dumps(nai_map, ensure_ascii=False, indent=None)
+    )
 
 
 # ---------------------------------------------------------------------------
