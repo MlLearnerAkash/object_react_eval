@@ -148,7 +148,7 @@ class ObjRelLearntController:
 
         # EMA state for waypoint smoothing (reduces goal-mask oscillation)
         self._ema_wp = None          # smoothed (dx, dy) waypoint
-        self._ema_alpha = 0.35       # EMA blend: 0.35*new + 0.65*prev
+        self._ema_alpha = 0.6        # EMA blend: 0.6*new + 0.4*prev — faster adaptation
 
         # Collision escape state
         self.consecutive_collisions = 0
@@ -314,14 +314,14 @@ class ObjRelLearntController:
             wp = self._ema_wp
             # ───────────────────────────────────────────────────────────────────
 
-            # (x_local, z_local) in Habitat agent frame:
-            #   x_local: +RIGHT  (lateral)
-            #   z_local: +BACKWARD  (Habitat forward is -z)
-            forward = float(-wp[1])     # meters (cumulative over waypoint_index+1 steps)
-            left    = float(-wp[0])     # meters
+            # Training convention (convert_h5_to_vint, yaw = atan2(fwd_x, fwd_z)):
+            #   wp[0]: LEFT  component (positive = left)
+            #   wp[1]: FORWARD component (positive = ahead)
+            forward = float(wp[1])      # meters (cumulative over waypoint_index+1 steps)
+            left    = float(wp[0])      # meters
 
-            w_rollout_fwd  = -self.action_pred[:, 1]
-            w_rollout_left = -self.action_pred[:, 0]
+            w_rollout_fwd  = self.action_pred[:, 1]
+            w_rollout_left = self.action_pred[:, 0]
             w_rollout = np.arctan2(w_rollout_left, w_rollout_fwd)
             w_rollout = np.insert(w_rollout, 0, 0)
             self.w_rollout = w_rollout[1:] - w_rollout[:-1]
@@ -331,17 +331,19 @@ class ObjRelLearntController:
 
             # bearing to the cumulative waypoint (rad); +ve = LEFT in agent frame
             w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
-            w = float(np.clip(w, -0.5, 0.5))   # raised from ±0.1
-            # forward velocity: cumulative meters over (waypoint_index+1) prediction
-            # steps → instantaneous command.
-            steps_ahead = max(1, int(self.waypoint_index) + 1)
-            v = max(0.0, forward / steps_ahead)
-            v = float(min(v, 0.15))             # raised from 0.05
+            w = float(np.clip(w, -0.5, 0.5))
+            # forward velocity: allow small reverse so robot can back up when it has
+            # overshot; clamp to [-0.05, 0.15]
+            wi = int(self.waypoint_index)
+            if wi < 0:
+                wi = self.config["len_traj_pred"] + wi   # convert -1 → 9, etc.
+            steps_ahead = max(1, wi + 1)
+            v = float(np.clip(forward / steps_ahead, -0.05, 0.15))
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
             logger.info(
-                f"wp(local x,z)=({wp[0]:+.3f},{wp[1]:+.3f}) "
+                f"wp(left,fwd)=({wp[0]:+.3f},{wp[1]:+.3f}) "
                 f"-> fwd={forward:+.3f} left={left:+.3f} | v={v:.3f} w={w:+.3f}"
             )
             vis_img = visualize_prediction(
@@ -388,16 +390,26 @@ class ObjRelLearntController:
             wp = self._ema_wp
             # ───────────────────────────────────────────────────────────────────
 
-            w_rollout = np.arctan2(self.action_pred[:, 1], self.action_pred[:, 0])
+            # wp[0] = LEFT, wp[1] = FORWARD (same convention as predict())
+            w_rollout_fwd  = self.action_pred[:, 1]
+            w_rollout_left = self.action_pred[:, 0]
+            w_rollout = np.arctan2(w_rollout_left, w_rollout_fwd)
             w_rollout = np.insert(w_rollout, 0, 0)
-            self.w_rollout = -(w_rollout[1:] - w_rollout[:-1])
-            v_rollout = 0.2 * self.action_pred[:, 0]
+            self.w_rollout = w_rollout[1:] - w_rollout[:-1]
+            v_rollout = 0.2 * w_rollout_fwd
             v_rollout = np.insert(v_rollout, 0, 0)
             self.v_rollout = v_rollout[1:] - v_rollout[:-1]
 
-            w = np.arctan2(wp[-1], wp[-2])
-            w = np.clip(w, -0.5, 0.5)   # raised from ±0.1
-            v = min(wp[0] / 100, 0.15)  # raised cap from 0.05
+            forward = float(wp[1])
+            left    = float(wp[0])
+            w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
+            w = float(np.clip(w, -0.5, 0.5))
+            # allow small reverse so robot can back up when it has overshot
+            wi = int(self.waypoint_index)
+            if wi < 0:
+                wi = self.config["len_traj_pred"] + wi
+            steps_ahead = max(1, wi + 1)
+            v = float(np.clip(forward / steps_ahead * 5.0, -0.1, 0.40))
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
@@ -478,11 +490,11 @@ def plot_traj(ax, traj, quiver_freq=1):
     """
     Plot trajectory
     """
-    # Convert from habitat local coordinates (x=+Right, z=+Backward)
-    # to plot coordinates (x=+Left, y=+Forward)
-    plot_x = -traj[:, 0]
-    plot_y = -traj[:, 1]
-    
+    # traj[:, 0] = LEFT component, traj[:, 1] = FORWARD component
+    # plot_x = left (positive left), plot_y = forward (positive ahead)
+    plot_x = traj[:, 0]
+    plot_y = traj[:, 1]
+
     ax.plot(
         plot_x,
         plot_y,
@@ -490,15 +502,13 @@ def plot_traj(ax, traj, quiver_freq=1):
         alpha=0.5,
         marker="o",
     )
-    
+
     bearings = gen_bearings_from_waypoints(traj)
-    # bearings[:, 0] is d(x_local) (Right), bearings[:, 1] is d(z_local) (Backward)
-    # So d(plot_x) = -dx = -bearings[:, 0], d(plot_y) = -dz = -bearings[:, 1]
     ax.quiver(
         plot_x[::quiver_freq],
         plot_y[::quiver_freq],
-        -bearings[::quiver_freq, 0],
-        -bearings[::quiver_freq, 1],
+        bearings[::quiver_freq, 0],
+        bearings[::quiver_freq, 1],
         color="y",
         scale=1.0,
     )
