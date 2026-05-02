@@ -25,7 +25,7 @@ env: "sim"
 split: "test"
 threshold_goal_distance: 1.0
 max_start_distance: "hard"
-max_steps: 500
+max_steps: 300
 
 exp_name: "lang_mp3d_eval"
 
@@ -33,7 +33,7 @@ run_list: ''
 path_run: ''
 
 # controller and mapping params
-method: 'learnt'
+method: "learnt" #['learnt', "disabled"]
 segmentor: 'fast_sam'
 goal_source: 'lang_e3d'
 graph_filename: null
@@ -41,8 +41,8 @@ infer_depth: False
 infer_traversable: False
 
 # lang_e3d-specific
-joint_checkpoint: "/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_23_10_35_23_/joint_latest.pth" #'/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
-#/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_28_08_22_43_/joint_latest.pth #
+joint_checkpoint: "/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_30_01_43_45_/joint_latest.pth" #'/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
+#/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_23_10_35_23_/joint_latest.pth #
 # h5_path: '/media/opervu-user/Data2/ws/data_langgeonet_e3d_action/e3d_action_lmrxr_val_seen_ep200.h5'
 
 # Instruction mode: "episodic" uses the single episode-level instruction for
