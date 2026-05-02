@@ -848,10 +848,10 @@ class Episode:
             K = masks_np.shape[0]
 
             if K == 0:
-                # Nothing to encode this frame; let downstream handle stop signal.
-                self.control_input_learnt = [None, None]
+                # No masks: reuse last valid tensor so agent keeps moving.
+                # goal_mask=1 everywhere → visual servoing goes straight.
+                self.control_input_learnt = getattr(self, '_last_goal_tensor', [None, None])
                 self.control_input_robohop = semantic_instance
-                # Flat goal_mask (max cost everywhere) matching gt_topometric format
                 self.goal_mask = np.full(
                     (rgb.shape[0], rgb.shape[1]), fill_value=1.0, dtype=np.float32
                 )
@@ -882,10 +882,18 @@ class Episode:
                     raise RuntimeError(
                         f"LangGeoNet returned {logits.shape[0]} costs for {K} masks")
 
-                #Min-max normalise to [0, 1]; lower = closer to goal
-                lo, hi = float(logits.min()), float(logits.max())
-                if hi - lo > 1e-8:
-                    pls = (logits - lo) / (hi - lo)
+                # ── Build TopoPaths-style goal tensor for learnt controller ───
+                # Use continuous near/far positional-encoding blend by cost.
+                # This matches TopoPaths.build_differentiable_goal() and routes
+                # predict_from_goal_enc() (not predict() with corrupt PL scale).
+                topopaths = self.preload_data.get("topopaths")
+                rank_enc_np = topopaths.rank_enc          # [maxRank+1, dims]
+                near_enc = rank_enc_np[0]                 # [dims] lowest PL
+                far_enc  = rank_enc_np[-1]                # [dims] highest PL
+
+                lo_t, hi_t = float(logits.min()), float(logits.max())
+                if hi_t - lo_t > 1e-8:
+                    pls = (logits - lo_t) / (hi_t - lo_t)  # [K] in [0,1]
                 else:
                     pls = np.zeros_like(logits)
                 goal_mask = np.ones(
@@ -901,8 +909,31 @@ class Episode:
                 # ── control_input_robohop: semantic_instance for robohop/tango
                 # self.control_input_robohop = semantic_instance
 
-                # ── control_input_learnt: [masks, pls] for learnt controller ──
-                self.control_input_learnt = [masks_bool, pls.astype(np.float32)]
+                # ── control_input_learnt: Tensor [1, dims, H//4, W//4] for learnt controller ──
+                # Per-object encoding: blend near_enc and far_enc by normalized cost
+                
+                # Continuous near/far blend → [1, dims, H//4, W//4] Tensor
+                # Matches TopoPaths.build_differentiable_goal() convention:
+                #   cost≈0 (near goal) → near_enc = rank_enc[0]
+                #   cost≈1 (far)       → far_enc  = rank_enc[-1]
+                costs_np = pls  # [K] in [0,1], 0=near goal
+                obj_enc = ((1.0 - costs_np[:, None]) * near_enc
+                           + costs_np[:, None] * far_enc)  # [K, dims]
+
+                H_full, W_full = rgb.shape[0], rgb.shape[1]
+                masks_f = torch.from_numpy(masks_np.astype(np.float32))
+                masks_half = torch.nn.functional.interpolate(
+                    masks_f.unsqueeze(1),
+                    size=(H_full // 4, W_full // 4),
+                    mode='nearest',
+                ).squeeze(1).numpy()  # [K, H//4, W//4]
+
+                img_enc = np.einsum("kd,khw->dhw", obj_enc, masks_half)  # [dims, H//4, W//4]
+                goal_tensor = torch.from_numpy(img_enc.astype(np.float32)).unsqueeze(0)
+                self._last_goal_tensor = goal_tensor        # cache for K==0 fallback
+                self.control_input_learnt = goal_tensor     # Tensor → predict_from_goal_enc
+                #NOTE: Discrete encoding--> going through .predict()
+                # self.control_input_learnt = [masks_bool, pls.astype(np.float32)]
 
         else:
             raise NotImplementedError(f"{self.args.goal_source} is not available...")
@@ -965,6 +996,36 @@ class Episode:
                     rgb, self.control_input_learnt)
             self.controller_logs = self.goal_controller.controller_logs
 
+        elif control_method == 'disabled':
+            # Visual servoing: bypass GNM entirely.
+            # Uses goal_mask from LangGeoNetV2 (low=near goal) to steer toward
+            # the centroid of the minimum-cost object region.
+            gm = self.goal_mask  # [H, W] float32; 0=near goal, 1=background
+            H_im, W_im = gm.shape
+            min_cost = float(gm.min())
+            if min_cost < 0.95:  # at least one object identified below background
+                thresh = min_cost + 0.15 * (1.0 - min_cost)
+                near_mask = gm <= thresh
+                if near_mask.sum() > 0:
+                    _, xs = np.where(near_mask)
+                    cx = float(xs.mean())
+                    # cx < W/2 → object left → turn left (positive w)
+                    angular_err = (W_im / 2.0 - cx) / (W_im / 2.0)
+                    if abs(cx - W_im / 2.0) < W_im * 0.05:  # dead-band ±5%
+                        angular_err = 0.0
+                    w = float(np.clip(0.5 * angular_err, -0.5, 0.5))
+                    v = 0.06
+                else:
+                    v, w = 0.05, 0.0
+            else:
+                v, w = 0.05, 0.0  # no near-goal object visible; go straight
+            self.velocity_control = v
+            self.theta_control = -w  # convention: theta_control = -w
+            self.vis_img = self.vis_img_default.copy()
+            self.controller_logs = []
+
+
+
         else:
             raise NotImplementedError(f"{self.args.method} is not available...")
         return goals_image
@@ -988,23 +1049,27 @@ class Episode:
             self.collided = utils.has_collided(self.sim, previous_state, current_state)
         else:
             # ── Collision escape: reverse + hard-turn after 5 stuck steps ─────
+            # Track on self so this works even when goal_controller is None
+            # (e.g. method='disabled' visual-servoing path).
             _ESCAPE_THRESHOLD = 5
             if self.collided:
-                self.goal_controller.consecutive_collisions = getattr(
-                    self.goal_controller, 'consecutive_collisions', 0) + 1
+                self._consecutive_collisions = getattr(self, '_consecutive_collisions', 0) + 1
             else:
-                self.goal_controller.consecutive_collisions = 0
+                self._consecutive_collisions = 0
+            # Mirror onto goal_controller if it exists (backward compat)
+            if self.goal_controller is not None:
+                self.goal_controller.consecutive_collisions = self._consecutive_collisions
 
-            if self.goal_controller.consecutive_collisions >= _ESCAPE_THRESHOLD:
+            if self._consecutive_collisions >= _ESCAPE_THRESHOLD:
                 logger.warning(
                     f"Collision escape triggered after "
-                    f"{self.goal_controller.consecutive_collisions} stuck steps"
+                    f"{self._consecutive_collisions} stuck steps"
                 )
-                escape_v = -0.05                   # reverse
-                escape_w = 0.5                     # hard left turn
-                # Reset EMA so the next prediction starts fresh
-                self.goal_controller._ema_wp = None
-                self.goal_controller.consecutive_collisions = 0
+                escape_v = -0.05
+                escape_w = 0.5
+                if self.goal_controller is not None:
+                    self.goal_controller._ema_wp = None
+                self._consecutive_collisions = 0
                 self.agent, self.sim, self.collided = utils.apply_velocity(
                     vel_control=self.vel_control,
                     agent=self.agent,
