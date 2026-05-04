@@ -813,10 +813,6 @@ class Episode:
             device = self.device
 
             # ── Resolve instruction for this step ─────────────────────────────
-            # "episodic"     : same episode-level instruction every step.
-            # "next_action"  : look up per-frame NAI from the run-level LMDB
-            #                  (built in run() by build_run_instructions_lmdb).
-            #                  Falls back to episodic when entry is missing/empty.
             instruction = self.episode_instruction
             if (self.instruction_type == "next_action"
                     and self.instr_lmdb is not None
@@ -835,9 +831,20 @@ class Episode:
                         logger.debug(f"[ep {self.ep_num} frame {goal_img_idx:03d}] "
                                      "empty NAI — using episodic")
 
-            # ── FastSAM segmentation ──────────────────────────────────────────
+            #Training object categories
+            _lang_e3d_obj_cats = [
+                "chair", "door", "table", "picture", "cabinet", "cushion",
+                "window", "sofa", "bed", "curtain", "chest of drawers",
+                "plant", "sink", "stairs", "toilet", "stool", "towel",
+                "mirror", "tv monitor", "shower", "bathtub", "counter",
+                "fireplace", "shelving", "blinds", "gym equipment",
+                "seating", "furniture", "appliances", "clothes",
+            ]
             if segmentor is not None:
-                seg_result = segmentor.segment(rgb[:, :, :3], retMaskAsDict=False)
+                seg_result = segmentor.segment(
+                    rgb[:, :, :3], retMaskAsDict=False,
+                     textCulls=False,
+                )#textLabels=_lang_e3d_obj_cats,
                 if seg_result[0] is None:
                     masks_np = np.zeros((0, rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
                 else:
@@ -848,8 +855,6 @@ class Episode:
             K = masks_np.shape[0]
 
             if K == 0:
-                # No masks: reuse last valid tensor so agent keeps moving.
-                # goal_mask=1 everywhere → visual servoing goes straight.
                 self.control_input_learnt = getattr(self, '_last_goal_tensor', [None, None])
                 self.control_input_robohop = semantic_instance
                 self.goal_mask = np.full(
@@ -876,16 +881,11 @@ class Episode:
                     lang_preds, _ = lange3d(
                         pixel_values, [masks_tensor], input_ids, attn_mask)
 
-                # lang_preds is a list[B] of [K_b] tensors; B==1 here.
                 logits = lang_preds[0].detach().float().cpu().numpy()
                 if logits.shape[0] != K:
                     raise RuntimeError(
                         f"LangGeoNet returned {logits.shape[0]} costs for {K} masks")
 
-                # ── Build TopoPaths-style goal tensor for learnt controller ───
-                # Use continuous near/far positional-encoding blend by cost.
-                # This matches TopoPaths.build_differentiable_goal() and routes
-                # predict_from_goal_enc() (not predict() with corrupt PL scale).
                 topopaths = self.preload_data.get("topopaths")
                 rank_enc_np = topopaths.rank_enc          # [maxRank+1, dims]
                 near_enc = rank_enc_np[0]                 # [dims] lowest PL
@@ -909,13 +909,6 @@ class Episode:
                 # ── control_input_robohop: semantic_instance for robohop/tango
                 # self.control_input_robohop = semantic_instance
 
-                # ── control_input_learnt: Tensor [1, dims, H//4, W//4] for learnt controller ──
-                # Per-object encoding: blend near_enc and far_enc by normalized cost
-                
-                # Continuous near/far blend → [1, dims, H//4, W//4] Tensor
-                # Matches TopoPaths.build_differentiable_goal() convention:
-                #   cost≈0 (near goal) → near_enc = rank_enc[0]
-                #   cost≈1 (far)       → far_enc  = rank_enc[-1]
                 costs_np = pls  # [K] in [0,1], 0=near goal
                 obj_enc = ((1.0 - costs_np[:, None]) * near_enc
                            + costs_np[:, None] * far_enc)  # [K, dims]
@@ -930,8 +923,8 @@ class Episode:
 
                 img_enc = np.einsum("kd,khw->dhw", obj_enc, masks_half)  # [dims, H//4, W//4]
                 goal_tensor = torch.from_numpy(img_enc.astype(np.float32)).unsqueeze(0)
-                self._last_goal_tensor = goal_tensor        # cache for K==0 fallback
-                self.control_input_learnt = goal_tensor     # Tensor → predict_from_goal_enc
+                self._last_goal_tensor = goal_tensor
+                self.control_input_learnt = goal_tensor
                 #NOTE: Discrete encoding--> going through .predict()
                 # self.control_input_learnt = [masks_bool, pls.astype(np.float32)]
 
@@ -985,7 +978,6 @@ class Episode:
 
         elif control_method == 'learnt':
             if isinstance(self.control_input_learnt, torch.Tensor):
-                # lang_e3d: goal already encoded as tensor [1, dims, H, W]
                 self.velocity_control, self.theta_control, self.vis_img = \
                     self.goal_controller.predict_from_goal_enc(
                         rgb, self.control_input_learnt)
@@ -998,8 +990,6 @@ class Episode:
 
         elif control_method == 'disabled':
             # Visual servoing: bypass GNM entirely.
-            # Uses goal_mask from LangGeoNetV2 (low=near goal) to steer toward
-            # the centroid of the minimum-cost object region.
             gm = self.goal_mask  # [H, W] float32; 0=near goal, 1=background
             H_im, W_im = gm.shape
             min_cost = float(gm.min())
@@ -1018,9 +1008,9 @@ class Episode:
                 else:
                     v, w = 0.05, 0.0
             else:
-                v, w = 0.05, 0.0  # no near-goal object visible; go straight
+                v, w = 0.05, 0.0
             self.velocity_control = v
-            self.theta_control = -w  # convention: theta_control = -w
+            self.theta_control = -w
             self.vis_img = self.vis_img_default.copy()
             self.controller_logs = []
 
@@ -1048,9 +1038,6 @@ class Episode:
             current_state = self.agent.state
             self.collided = utils.has_collided(self.sim, previous_state, current_state)
         else:
-            # ── Collision escape: reverse + hard-turn after 5 stuck steps ─────
-            # Track on self so this works even when goal_controller is None
-            # (e.g. method='disabled' visual-servoing path).
             _ESCAPE_THRESHOLD = 5
             if self.collided:
                 self._consecutive_collisions = getattr(self, '_consecutive_collisions', 0) + 1

@@ -148,7 +148,7 @@ class ObjRelLearntController:
 
         # EMA state for waypoint smoothing (reduces goal-mask oscillation)
         self._ema_wp = None          # smoothed (dx, dy) waypoint
-        self._ema_alpha = 0.6        # EMA blend: 0.6*new + 0.4*prev — faster adaptation
+        self._ema_alpha = 0.8        # EMA blend: 0.8*new + 0.2*prev — responsive for short-horizon
 
         # Collision escape state
         self.consecutive_collisions = 0
@@ -332,13 +332,13 @@ class ObjRelLearntController:
             # bearing to the cumulative waypoint (rad); +ve = LEFT in agent frame
             w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
             w = float(np.clip(w, -0.5, 0.5))
-            # forward velocity: allow small reverse so robot can back up when it has
-            # overshot; clamp to [-0.05, 0.15]
+            # forward velocity: no reverse — backward predictions mean confused state,
+            # not intentional backing up; clamp to [0.0, 0.15]
             wi = int(self.waypoint_index)
             if wi < 0:
                 wi = self.config["len_traj_pred"] + wi   # convert -1 → 9, etc.
             steps_ahead = max(1, wi + 1)
-            v = float(np.clip(forward / steps_ahead, -0.05, 0.15))
+            v = float(np.clip(forward / steps_ahead, 0.0, 0.15))
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
@@ -404,16 +404,20 @@ class ObjRelLearntController:
             left    = float(wp[0])
             w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
             w = float(np.clip(w, -0.5, 0.5))
-            # allow small reverse so robot can back up when it has overshot
+            # no reverse — backward prediction means confused state, not intentional overshoot
             wi = int(self.waypoint_index)
             if wi < 0:
                 wi = self.config["len_traj_pred"] + wi
             steps_ahead = max(1, wi + 1)
-            v = float(np.clip(forward / steps_ahead * 5.0, -0.1, 0.40))
+            v = float(np.clip(forward / steps_ahead, 0.0, 0.15))
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
-            logger.info(f"Predicted lin: {v:.2f} and ang: {w:.2f}")
+            logger.info(
+                f"wp[{wi}](left,fwd)=({wp_raw[0]:+.4f},{wp_raw[1]:+.4f}) "
+                f"ema_wp=({wp[0]:+.4f},{wp[1]:+.4f}) "
+                f"→ fwd={forward:+.4f} left={left:+.4f} | v={v:.3f} w={w:+.3f}"
+            )
             vis_img = visualize_prediction(
                 rgb,
                 self.action_pred,
