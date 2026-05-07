@@ -3,7 +3,8 @@ path_models: ''
 path_results: './out/results/'
 
 # Override to point at the MP3D dataset built from the H5.
-path_episodes_root: "/data/ws/VLN-CE/controller/object_react/eval/dataset/mp3d_iin_test"
+path_episodes_root: "/data/ws/VLN-CE/controller/object_react/eval/data/mp3d_iin_test"
+#"/data/ws/VLN-CE/controller/object_react/eval/dataset/mp3d_iin_test"
 #'/data/ws/VLN-CE/controller/object_react/eval/data/mp3d_iin_test'
 path_scenes_root: '/data/dataset/RXR/dataset/mp3d/data/scene_datasets/mp3d/v1/tasks/mp3d_habitat/mp3d'
 scene_dataset: 'mp3d'
@@ -29,7 +30,8 @@ run_list: ''
 path_run: ''
 
 # controller and mapping params
-method: "learnt" #['learnt', "disabled"] 
+method: "learnt" #['learnt', "disabled"]
+mask_source: "sim" #["sim", None]
 segmentor: 'fast_sam'
 goal_source: 'lang_e3d'
 graph_filename: null
@@ -37,7 +39,9 @@ infer_depth: False
 infer_traversable: False
 
 # lang_e3d-specific
-joint_checkpoint: "/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_30_01_43_45_/joint_latest.pth"
+joint_checkpoint: "/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/keep_600_epoch_joint_train_2026_04_30_01_43_45_/joint_latest.pth"
+#"/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_05_04_20_48_48_/joint_latest.pth"
+#
 #"/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_30_01_43_45_/joint_latest.pth" 
 #'/data/ws/VLN-CE/controller/object_react/train/checkpoints/joint/best_joint_190426_episodic_inst.pth'
 #/data/ws/VLN-CE/controller/object_react/train/logs/e3d_object_react/joint_train_2026_04_23_10_35_23_/joint_latest.pth #
