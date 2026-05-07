@@ -148,7 +148,7 @@ class ObjRelLearntController:
 
         # EMA state for waypoint smoothing (reduces goal-mask oscillation)
         self._ema_wp = None          # smoothed (dx, dy) waypoint
-        self._ema_alpha = 0.8        # EMA blend: 0.8*new + 0.2*prev — responsive for short-horizon
+        self._ema_alpha = 0.35        # EMA blend: 0.8*new + 0.2*prev — responsive for short-horizon
 
         # Collision escape state
         self.consecutive_collisions = 0
@@ -314,14 +314,14 @@ class ObjRelLearntController:
             wp = self._ema_wp
             # ───────────────────────────────────────────────────────────────────
 
-            # Training convention (convert_h5_to_vint, yaw = atan2(fwd_x, fwd_z)):
-            #   wp[0]: LEFT  component (positive = left)
-            #   wp[1]: FORWARD component (positive = ahead)
-            forward = float(wp[1])      # meters (cumulative over waypoint_index+1 steps)
-            left    = float(wp[0])      # meters
+            # vint convention (to_local_coords):
+            #   wp[0] = FORWARD (parallel to heading, +ahead)
+            #   wp[1] = LEFT    (perpendicular, +left)
+            forward = float(wp[0])     # meters (cumulative over waypoint_index+1 steps)
+            left    = float(wp[1])     # meters
 
-            w_rollout_fwd  = self.action_pred[:, 1]
-            w_rollout_left = self.action_pred[:, 0]
+            w_rollout_fwd  = self.action_pred[:, 0]
+            w_rollout_left = self.action_pred[:, 1]
             w_rollout = np.arctan2(w_rollout_left, w_rollout_fwd)
             w_rollout = np.insert(w_rollout, 0, 0)
             self.w_rollout = w_rollout[1:] - w_rollout[:-1]
@@ -331,19 +331,17 @@ class ObjRelLearntController:
 
             # bearing to the cumulative waypoint (rad); +ve = LEFT in agent frame
             w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
-            w = float(np.clip(w, -0.5, 0.5))
-            # forward velocity: no reverse — backward predictions mean confused state,
-            # not intentional backing up; clamp to [0.0, 0.15]
-            wi = int(self.waypoint_index)
-            if wi < 0:
-                wi = self.config["len_traj_pred"] + wi   # convert -1 → 9, etc.
-            steps_ahead = max(1, wi + 1)
-            v = float(np.clip(forward / steps_ahead, 0.0, 0.15))
+            w = float(np.clip(w, -0.5, 0.5))   # raised from ±0.1
+            # forward velocity: cumulative meters over (waypoint_index+1) prediction
+            # steps → instantaneous command.
+            steps_ahead = max(1, int(self.waypoint_index) + 1)
+            v = max(0.0, forward / steps_ahead)
+            v = float(min(v, 0.15))             # raised from 0.05
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
             logger.info(
-                f"wp(left,fwd)=({wp[0]:+.3f},{wp[1]:+.3f}) "
+                f"wp(fwd,left)=({wp[0]:+.3f},{wp[1]:+.3f}) "
                 f"-> fwd={forward:+.3f} left={left:+.3f} | v={v:.3f} w={w:+.3f}"
             )
             vis_img = visualize_prediction(
@@ -367,61 +365,61 @@ class ObjRelLearntController:
     def predict_from_goal_enc(self, rgb, goal_img_tensor):
         """Predict v/w from a pre-built goal encoding tensor (lang_e3d path).
 
-        Bypasses encode_goal / ready_goal; goal_img_tensor is the output of
-        TopoPaths.build_differentiable_goal split off the viz channels:
-        shape [1, dims, H//2, W//2] (e.g. [1, 8, 60, 80]).
+        goal_img_tensor MUST be the output of build_differentiable_goal:
+        shape [1, 3+dims, Hh, Wh] where first 3 channels = viz heatmap,
+        remaining dims channels = goal encoding.
+
+        Matches the training ``goal_was_replaced`` path exactly:
+        no resize/transform on the encoding, just split + .to(device).
         """
         self.iter += 1
         v, w = 0, 0
         with torch.no_grad():
             obs_image = self.ready_obs(rgb)
-            goal_image = goal_img_tensor.to(self.device)
+
+            # ── Split viz from goal encoding — no resize (matches training) ──
+            goal_enc = goal_img_tensor.to(self.device)           # [1, 3+dims, Hh, Wh]
+            viz, goal_image = goal_enc.split(
+                [3, goal_enc.shape[1] - 3], dim=1
+            )  # viz: [1, 3, Hh, Wh]  goal_image: [1, dims, Hh, Wh]
+
+            # Store viz for visualization (normalised to [0,1] range)
+            self.goal_mask_vis = viz[0].float().cpu().numpy().transpose(1, 2, 0)
+            vmin, vmax = self.goal_mask_vis.min(), self.goal_mask_vis.max()
+            if vmax - vmin > 1e-8:
+                self.goal_mask_vis = (self.goal_mask_vis - vmin) / (vmax - vmin)
 
             model_outputs = self.model(obs_image, goal_image)
             _, action_pred = model_outputs
-            self.action_pred = action_pred[0].float().cpu().numpy()
+            self.action_pred = action_pred[0].float().cpu().numpy()*0.25
             wp_raw = self.action_pred[self.waypoint_index][:2]
 
-            # ── EMA waypoint smoothing (reduces goal-mask oscillation) ──────────
-            if self._ema_wp is None:
-                self._ema_wp = wp_raw.copy()
-            else:
-                self._ema_wp = self._ema_alpha * wp_raw + (1 - self._ema_alpha) * self._ema_wp
-            wp = self._ema_wp
-            # ───────────────────────────────────────────────────────────────────
+            wp= wp_raw
 
-            # wp[0] = LEFT, wp[1] = FORWARD (same convention as predict())
-            w_rollout_fwd  = self.action_pred[:, 1]
-            w_rollout_left = self.action_pred[:, 0]
-            w_rollout = np.arctan2(w_rollout_left, w_rollout_fwd)
-            w_rollout = np.insert(w_rollout, 0, 0)
-            self.w_rollout = w_rollout[1:] - w_rollout[:-1]
-            v_rollout = 0.2 * w_rollout_fwd
-            v_rollout = np.insert(v_rollout, 0, 0)
-            self.v_rollout = v_rollout[1:] - v_rollout[:-1]
+            # vint convention (to_local_coords):
+            #   wp[0] = FORWARD (parallel to heading, +ahead)
+            #   wp[1] = LEFT    (perpendicular, +left)
+            forward = float(wp[0])     # meters (cumulative over waypoint_index+1 steps)
+            left    = float(wp[1])     # meters
 
-            forward = float(wp[1])
-            left    = float(wp[0])
+
+            # bearing to the cumulative waypoint (rad); +ve = LEFT in agent frame
             w = float(np.arctan2(left, forward)) if abs(forward) > 1e-6 else 0.0
             w = float(np.clip(w, -0.5, 0.5))
-            # no reverse — backward prediction means confused state, not intentional overshoot
-            wi = int(self.waypoint_index)
-            if wi < 0:
-                wi = self.config["len_traj_pred"] + wi
-            steps_ahead = max(1, wi + 1)
-            v = float(np.clip(forward / steps_ahead, 0.0, 0.15))
+            steps_ahead = max(1, int(self.waypoint_index) + 1)
+            v = max(0.0, forward / steps_ahead)
+            v = float(min(v, 0.15))
             if self.use_vel_filter:
                 v, w = self.filter_vel([v, w])
 
             logger.info(
-                f"wp[{wi}](left,fwd)=({wp_raw[0]:+.4f},{wp_raw[1]:+.4f}) "
-                f"ema_wp=({wp[0]:+.4f},{wp[1]:+.4f}) "
-                f"→ fwd={forward:+.4f} left={left:+.4f} | v={v:.3f} w={w:+.3f}"
+                f"wp(fwd,left)=({wp[0]:+.4f},{wp[1]:+.4f}) "
+                f"→ fwd={forward:+.3f} left={left:+.3f} | v={v:.4f} w={w:+.4f}"
             )
             vis_img = visualize_prediction(
                 rgb,
                 self.action_pred,
-                self.goal_mask_vis,  # None for lang_e3d — visualise_prediction handles this
+                self.goal_mask_vis,
                 save_path=None,
                 get_plot_img=True,
             )
@@ -494,10 +492,10 @@ def plot_traj(ax, traj, quiver_freq=1):
     """
     Plot trajectory
     """
-    # traj[:, 0] = LEFT component, traj[:, 1] = FORWARD component
-    # plot_x = left (positive left), plot_y = forward (positive ahead)
-    plot_x = traj[:, 0]
-    plot_y = traj[:, 1]
+    # vint convention: traj[:, 0] = FORWARD (+ahead), traj[:, 1] = LEFT (+left)
+    # egocentric top-down: x = lateral (LEFT), y = depth (FORWARD)
+    plot_x = traj[:, 1]   # LEFT
+    plot_y = traj[:, 0]   # FORWARD
 
     ax.plot(
         plot_x,
@@ -508,11 +506,13 @@ def plot_traj(ax, traj, quiver_freq=1):
     )
 
     bearings = gen_bearings_from_waypoints(traj)
+    # bearings[:,0]=cos(yaw)=FORWARD component, bearings[:,1]=sin(yaw)=LEFT component
+    # swap to match plot axes (x=LEFT, y=FORWARD)
     ax.quiver(
         plot_x[::quiver_freq],
         plot_y[::quiver_freq],
-        bearings[::quiver_freq, 0],
-        bearings[::quiver_freq, 1],
+        bearings[::quiver_freq, 1],   # LEFT → x-axis
+        bearings[::quiver_freq, 0],   # FORWARD → y-axis
         color="y",
         scale=1.0,
     )
