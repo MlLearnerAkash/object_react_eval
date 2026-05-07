@@ -222,6 +222,15 @@ class Episode:
             self.sim, self.args.traversable_class_names, self.cull_categories
         )
 
+        # ── Build instance_id → category_name mapping (for sim-mask path) ──
+        self._insta_id_to_cat_name: dict[int, str] = {}
+        for _obj in self.sim.semantic_scene.objects:
+            try:
+                _iid = int(_obj.id.split("_")[-1])
+            except Exception:
+                continue
+            self._insta_id_to_cat_name[_iid] = _obj.category.name()
+
     def ready_agent(self):
         # get the initial agent state for this episode (i.e. the starting pose)
         path_agent_states = self.path_episode / "agent_states.npy"
@@ -831,20 +840,43 @@ class Episode:
                         logger.debug(f"[ep {self.ep_num} frame {goal_img_idx:03d}] "
                                      "empty NAI — using episodic")
 
-            #Training object categories
-            _lang_e3d_obj_cats = [
-                "chair", "door", "table", "picture", "cabinet", "cushion",
-                "window", "sofa", "bed", "curtain", "chest of drawers",
-                "plant", "sink", "stairs", "toilet", "stool", "towel",
-                "mirror", "tv monitor", "shower", "bathtub", "counter",
-                "fireplace", "shelving", "blinds", "gym equipment",
-                "seating", "furniture", "appliances", "clothes",
-            ]
-            if segmentor is not None:
+            _mask_source = getattr(self.args, "mask_source", "fast_sam").lower()
+            _EXCLUDE_CATS = {"ceiling", "beam", "objects", "lighting", "column",
+                             "misc", "railing", "floor", "void", "wall"}
+
+            if _mask_source == "sim" and self.sim is not None:
+                _sem = semantic_instance  # [H, W] int32 — per-pixel instance IDs
+                _area_thresh = max(1, int(np.ceil(0.001 * _sem.shape[0] * _sem.shape[1])))
+                _inst_ids = np.unique(_sem)
+                _mask_list: list[np.ndarray] = []
+                for _iid in _inst_ids:
+                    if int(_iid) == 0:  # background / void
+                        continue
+                    _mask = (_sem == _iid).astype(np.uint8)
+                    if _mask.sum() < _area_thresh:
+                        continue
+                    _cat = self._insta_id_to_cat_name.get(int(_iid), "").lower()
+                    if _cat in _EXCLUDE_CATS:
+                        continue
+                    _mask_list.append(_mask)
+                masks_np = np.stack(_mask_list) if _mask_list else np.zeros(
+                    (0, rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
+                if len(_mask_list) == 0:
+                    logger.warning("[lang_e3d sim-mask] no valid instance masks found")
+            elif segmentor is not None:
+                # ── FastSAM segmentation filtered to MP3D navigable objects ──
+                # All MP3D categories (from langes3dnet_train/dataset.py)
+                _MP3D_NAV_OBJECTS = [
+                    "chair", "door", "table", "picture", "cabinet", "cushion",
+                    "window", "sofa", "bed", "curtain", "chest of drawers",
+                    "plant", "sink", "stairs", "toilet", "stool", "towel",
+                    "mirror", "tv monitor", "shower", "bathtub", "counter",
+                    "fireplace", "shelving", "blinds", "gym equipment",
+                    "seating", "furniture", "appliances", "clothes",
+                ]
                 seg_result = segmentor.segment(
                     rgb[:, :, :3], retMaskAsDict=False,
-                     textCulls=False,
-                )#textLabels=_lang_e3d_obj_cats,
+                    textLabels=_MP3D_NAV_OBJECTS, textCulls=False)
                 if seg_result[0] is None:
                     masks_np = np.zeros((0, rgb.shape[0], rgb.shape[1]), dtype=np.uint8)
                 else:
@@ -861,7 +893,6 @@ class Episode:
                     (rgb.shape[0], rgb.shape[1]), fill_value=1.0, dtype=np.float32
                 )
             else:
-                # ── CLIP image + instruction tokenization ─────────────────────
                 clip_inputs = clip_processor(
                     images=_PIL_Image.fromarray(rgb[:, :, :3].astype(np.uint8)),
                     text=[instruction],
@@ -887,9 +918,6 @@ class Episode:
                         f"LangGeoNet returned {logits.shape[0]} costs for {K} masks")
 
                 topopaths = self.preload_data.get("topopaths")
-                rank_enc_np = topopaths.rank_enc          # [maxRank+1, dims]
-                near_enc = rank_enc_np[0]                 # [dims] lowest PL
-                far_enc  = rank_enc_np[-1]                # [dims] highest PL
 
                 lo_t, hi_t = float(logits.min()), float(logits.max())
                 if hi_t - lo_t > 1e-8:
@@ -906,23 +934,16 @@ class Episode:
 
                 self.goal_mask = goal_mask  # (H, W) float32, low = near goal
 
-                # ── control_input_robohop: semantic_instance for robohop/tango
-                # self.control_input_robohop = semantic_instance
-
-                costs_np = pls  # [K] in [0,1], 0=near goal
-                obj_enc = ((1.0 - costs_np[:, None]) * near_enc
-                           + costs_np[:, None] * far_enc)  # [K, dims]
-
-                H_full, W_full = rgb.shape[0], rgb.shape[1]
-                masks_f = torch.from_numpy(masks_np.astype(np.float32))
-                masks_half = torch.nn.functional.interpolate(
-                    masks_f.unsqueeze(1),
-                    size=(H_full // 4, W_full // 4),
-                    mode='nearest',
-                ).squeeze(1).numpy()  # [K, H//4, W//4]
-
-                img_enc = np.einsum("kd,khw->dhw", obj_enc, masks_half)  # [dims, H//4, W//4]
-                goal_tensor = torch.from_numpy(img_enc.astype(np.float32)).unsqueeze(0)
+                # (identical to training — train_utils.py:165,
+                #  train_eval_loop.py:463 — no interpolation on masks)
+                from torch.nn import functional as F_torch
+                masks_f = torch.from_numpy(masks_np.astype(np.float32))        # [K, 240, 320]
+                masks_f = F_torch.interpolate(
+                masks_f.unsqueeze(0), size=(60, 80), mode="nearest"
+                ).squeeze(0) 
+                goal_tensor = topopaths.build_differentiable_goal(
+                    lang_preds, masks_f.unsqueeze(0), [K], device,
+                )  # [1, 3+dims, H, W] — native mask resolution
                 self._last_goal_tensor = goal_tensor
                 self.control_input_learnt = goal_tensor
                 #NOTE: Discrete encoding--> going through .predict()
